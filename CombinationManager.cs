@@ -2,6 +2,7 @@ using UnityEngine;
 using System.Collections.Generic;
 using System;
 using System.Linq;
+using Unity.VisualScripting;
 
 public class CombinationManager : MonoBehaviour
 {
@@ -9,9 +10,11 @@ public class CombinationManager : MonoBehaviour
     ItemDrop[] droppedMushrooms;
     public Vector2 center;
     public Vector2 distance;
-    public List<Item> droppedItems = new List<Item>();
-    public Dictionary<Item, int> groupedItems = new Dictionary<Item, int>();
+    public List<GameObject> droppedItems = new List<GameObject>();
+    public Dictionary<GameObject, List<GameObject>> groupedItems = new Dictionary<GameObject, List<GameObject>>();
     public List<CombineRecipe> combineRecipes;
+    public DraggableSlot slotdrag;
+    float clusterThreshold = 0.75f;
     
     [Serializable]
     public class CombineRecipe
@@ -19,13 +22,13 @@ public class CombinationManager : MonoBehaviour
         public Item resultItem; // Could also be a GameObject if you want to spawn a prefab
         public List<ItemAmount> requiredItems;
 
-        public Dictionary<Item, int> GetRequiredItemsAsDictionary()
+        public Dictionary<GameObject, int> GetRequiredItemsAsDictionary()
         {
-            Dictionary<Item, int> dict = new Dictionary<Item, int>();
+            Dictionary<GameObject, int> dict = new Dictionary<GameObject, int>();
             foreach (ItemAmount pair in requiredItems)
             {
                 if (pair.item != null)
-                    dict[pair.item] = pair.amount;
+                    dict[pair.item] = pair.amount.Count;
             }
             return dict;
         }
@@ -33,14 +36,14 @@ public class CombinationManager : MonoBehaviour
     [Serializable]
     public struct ItemAmount
     {
-        public Item item;
-        public int amount;
+        public GameObject item;
+        public List<GameObject> amount;
     }
-    public GameObject CheckForMatchingRecipe(Dictionary<Item, int> ingredients)
+    public GameObject CheckForMatchingRecipe(Dictionary<GameObject, List<GameObject>> ingredients)
     {
         foreach (CombineRecipe recipe in combineRecipes)
         {
-            Dictionary<Item, int> required = recipe.GetRequiredItemsAsDictionary();
+            Dictionary<GameObject, int> required = recipe.GetRequiredItemsAsDictionary();
 
             if (DoesRecipeMatch(required, ingredients))
                 return recipe.resultItem.dropItem;
@@ -48,11 +51,11 @@ public class CombinationManager : MonoBehaviour
         return null; // No match
     }
 
-    private bool DoesRecipeMatch(Dictionary<Item, int> recipe, Dictionary<Item, int> ingredients)
+    private bool DoesRecipeMatch(Dictionary<GameObject, int> recipe, Dictionary<GameObject, List<GameObject>> ingredients)
     {
         foreach (var pair in recipe)
         {
-            if (!ingredients.ContainsKey(pair.Key) || ingredients[pair.Key] < pair.Value)
+            if (!ingredients.ContainsKey(pair.Key) || ingredients[pair.Key].Count < pair.Value)
                 return false;
         }
         return true;
@@ -62,26 +65,37 @@ public class CombinationManager : MonoBehaviour
         mushrooms = FindObjectsByType<MushroomBreak>(FindObjectsSortMode.None);
         droppedMushrooms = FindObjectsByType<ItemDrop>(FindObjectsSortMode.None);
 
-        GroupDroppedItems();
+        GroupClusters(droppedItems, clusterThreshold);
         SmeltItem();
         CombineItems();
     }
+    public void Start()
+    {
+        slotdrag = FindFirstObjectByType<DraggableSlot>();
+    }
     void SmeltItem() {
-        foreach (var mushroom in mushrooms)
+        var allMushrooms = mushrooms.Select(m => m.gameObject)
+            .Concat(droppedMushrooms.Select(m => m.gameObject))
+            .ToList();
+
+        foreach (var mushroom in allMushrooms)
         {
             if (!mushroom.CompareTag("fireMushroom")) continue;
 
             foreach (var item in droppedItems)
             {
-                if (item.dropped && item.isSmeltable &&
-                    Vector2.Distance(item.dropItem.transform.position, mushroom.transform.position) < 0.75f)
-                {
-                    item.dropped = false;
+                if (item == null) continue;
+                Item refItem = item.GetComponent<ItemDrop>().refItem;
+                if (refItem == null || !refItem.dropped || !refItem.isSmeltable) continue;
 
-                    Destroy(item.dropItem);
+                if (Vector2.Distance(item.transform.position, mushroom.transform.position) < 0.75f)
+                {
+                    refItem.dropped = false;
+
+                    Destroy(item);
                     Destroy(mushroom.gameObject);
 
-                    Instantiate(item.smeltItem.dropItem, 
+                    Instantiate(refItem.smeltItem.dropItem, 
                         mushroom.transform.position + Vector3.up * 0.375f, 
                         Quaternion.identity);
 
@@ -89,121 +103,129 @@ public class CombinationManager : MonoBehaviour
                 }
             }
         }
-
-        
-        foreach (var droppedMushroom in droppedMushrooms)
-        {
-            if (!droppedMushroom.CompareTag("fireMushroom")) continue;
-
-            foreach (var item in droppedItems)
-            {
-                if (item.dropped && item.isSmeltable &&
-                    Vector2.Distance(item.dropItem.transform.position, droppedMushroom.transform.position) < 0.75f)
-                {
-                    item.dropped = false;
-
-                    Destroy(item.dropItem);
-                    Destroy(droppedMushroom.gameObject);
-
-                    Instantiate(item.smeltItem.dropItem, 
-                        droppedMushroom.transform.position + Vector3.up * 0.375f, 
-                        Quaternion.identity);
-
-                    break;
-                }
-            }
-        }
     }
-    void GroupDroppedItems() 
+    public List<List<GameObject>> GroupClusters(List<GameObject> droppedItems, float clusterThreshold)
     {
-        groupedItems.Clear();
-        distance = Vector2.zero; 
-        center = Vector2.zero;
+        List<List<GameObject>> clusters = new List<List<GameObject>>();
+        HashSet<GameObject> visited = new HashSet<GameObject>();
 
-        droppedItems = FindObjectsByType<Item>(FindObjectsSortMode.None)
-        .Where(item => item.dropped && item.dropItem != null).ToList();
-        
-        if (droppedItems.Count == 0) return;
         foreach (var item in droppedItems)
         {
-            if (!item.dropped || item.dropItem == null) continue;
+            if (item == null || visited.Contains(item)) continue;
 
-            distance += (Vector2)item.dropItem.transform.position;
-            
-            if (groupedItems.ContainsKey(item))
-                groupedItems[item]++;
-            else
-                groupedItems.Add(item, 1);
-        }
+            // Create a new cluster
+            List<GameObject> cluster = new List<GameObject>();
+            Queue<GameObject> queue = new Queue<GameObject>();
+            queue.Enqueue(item);
 
-        int validItemCount = groupedItems.Values.Sum();
-        if (validItemCount > 0)
-            center = distance / validItemCount;
-
-        Debug.Log($"Grouped {groupedItems.Count} items, Center: {center}");
-    }
-    void CombineItems() {
-        if (groupedItems.Count == 0) return;
-
-    // Check mushrooms first
-        foreach (var mushroom in mushrooms)
-        {
-            if (!mushroom.CompareTag("combiner")) continue;
-            
-            if (Vector2.Distance(center, mushroom.transform.position) < 0.75f)
+            while (queue.Count > 0)
             {
-                GameObject result = CheckForMatchingRecipe(groupedItems);
-                if (result != null)
-                {
-                    // Remove used items
-                    foreach (var item in groupedItems.Keys.ToList())
-                    {
-                        if (item.dropItem != null)
-                        {
-                            item.dropped = false;
-                            Destroy(item.dropItem);
-                        }
-                    }
+                var currentItem = queue.Dequeue();
+                if (visited.Contains(currentItem)) continue;
 
-                    // Create result
-                    Vector3 spawnPos = mushroom.transform.position + Vector3.up * 0.375f;
-                    Instantiate(result, spawnPos, Quaternion.identity);
-                    
-                    // Cleanup
-                    Destroy(mushroom.gameObject);
-                    groupedItems.Clear();
-                    return;
+                visited.Add(currentItem);
+                cluster.Add(currentItem);
+
+                // Check for nearby items
+                foreach (var otherItem in droppedItems)
+                {
+                    if (otherItem == null || visited.Contains(otherItem)) continue;
+
+                    float distance = Vector2.Distance(currentItem.transform.position, otherItem.transform.position);
+                    if (distance <= clusterThreshold)
+                    {
+                        queue.Enqueue(otherItem);
+                    }
                 }
             }
-        }
 
-        foreach (var droppedMushroom in droppedMushrooms)
-        {
-            if (!droppedMushroom.CompareTag("combiner") || !droppedMushroom.refItem.dropped) continue;
-
-            if (Vector2.Distance(center, droppedMushroom.transform.position) < 0.75f)
+            // Add the cluster to the list of clusters
+            if (cluster.Count > 0)
             {
-                GameObject result = CheckForMatchingRecipe(groupedItems);
-                if (result != null)
+                clusters.Add(cluster);
+            }
+        }
+        return clusters;
+    }
+    void CombineItems()
+    {
+        if (droppedItems.Count == 0 || droppedMushrooms.Length == 0) return;
+
+    // Group dropped mushrooms into clusters
+        var allMushrooms = mushrooms.Select(m => m.gameObject)
+            .Concat(droppedMushrooms.Select(m => m.gameObject))
+            .ToList();
+
+        List<List<GameObject>> mushroomClusters = GroupClusters(allMushrooms, clusterThreshold);
+
+        foreach (var mushroomCluster in mushroomClusters)
+        {
+            // Calculate the center of the mushroom cluster
+            Vector2 clusterCenter = Vector2.zero;
+            foreach (var mushroom in mushroomCluster)
+            {
+                clusterCenter += (Vector2)mushroom.transform.position;
+            }
+            clusterCenter /= mushroomCluster.Count;
+
+            foreach (var mushroom in mushroomCluster)
+            {
+                if (!mushroom.CompareTag("combiner")) continue;
+
+                // Filter dropped items to include only those near the current mushroom
+                List<GameObject> nearbyItems = droppedItems
+                    .Where(item => item != null && Vector2.Distance(item.transform.position, mushroom.transform.position) < clusterThreshold)
+                    .ToList();
+
+                if (nearbyItems.Count == 0) continue;
+
+                // Group nearby items into clusters
+                List<List<GameObject>> itemClusters = GroupClusters(nearbyItems, clusterThreshold);
+
+                foreach (var itemCluster in itemClusters)
                 {
-                    // Remove used items
-                    foreach (var item in groupedItems.Keys.ToList())
+                    // Check for matching recipes
+                    Dictionary<GameObject, List<GameObject>> clusterGroupedItems = new Dictionary<GameObject, List<GameObject>>();
+                    foreach (var item in itemCluster)
                     {
-                        if (item.dropItem != null)
+                        Item refItem = item.GetComponent<ItemDrop>().refItem;
+                        if (refItem == null) continue;
+
+                        if (clusterGroupedItems.ContainsKey(refItem.dropItem))
                         {
-                            item.dropped = false;
-                            Destroy(item.dropItem);
+                            clusterGroupedItems[refItem.dropItem].Add(item);
+                        }
+                        else
+                        {
+                            clusterGroupedItems[refItem.dropItem] = new List<GameObject> { item };
                         }
                     }
 
-                    // Create result
-                    Vector3 spawnPos = droppedMushroom.transform.position + Vector3.up * 0.375f;
-                    Instantiate(result, spawnPos, Quaternion.identity);
-                    
-                    // Cleanup
-                    Destroy(droppedMushroom.gameObject);
-                    groupedItems.Clear();
-                    return;
+                    GameObject result = CheckForMatchingRecipe(clusterGroupedItems);
+                    if (result != null)
+                    {
+                        // Remove used items
+                        foreach (var kvp in clusterGroupedItems)
+                        {
+                            foreach (var item in kvp.Value)
+                            {
+                                Item refItem = item.GetComponent<ItemDrop>().refItem;
+                                if (!refItem.isPickaxe) {
+                                    Destroy(item);
+                                    droppedItems.Remove(item);
+                                }
+                            }
+                        }
+
+                        // Create the result item at the cluster center
+                        Vector3 spawnPos = mushroom.transform.position + Vector3.up * 0.375f;
+                        Instantiate(result, spawnPos, Quaternion.identity);
+
+                        // Cleanup
+                        Destroy(mushroom);
+                        groupedItems.Clear();
+                        break;
+                    }
                 }
             }
         }
